@@ -11,6 +11,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Detailed Docker experiment log for `nvcr.io/nvidia/pytorch:25.02-py3` environment setup and dependency resolution.
 - Explicit note that microphone permissions must be granted when starting the container (cannot be fixed after attach without restarting).
 - Explicit note to mount model cache directories to host before starting container to avoid redundant re-downloads and container bloat.
+- Production-ready Dockerfile and gpu-build.sh based on experimental findings (2026-05-09).
+
+#### Docker Implementation (2026-05-09)
+
+Created production-ready Docker configuration incorporating lessons learned from 2026-05-08 experiments.
+
+1. **Dockerfile**
+   - Base: `nvcr.io/nvidia/pytorch:25.02-py3` with TensorRT and CUDA 12.8 pre-installed
+   - System dependencies: `build-essential`, `cmake`, `libssl-dev`, `portaudio19-dev`, `python3-dev`, `git`, `wget`
+   - Pinned setuptools to v70.0.0 for build compatibility
+   - Installs openai-whisper v20240927 with `--no-build-isolation` flag (resolves metadata/wheel build failures)
+   - Audio support: pyaudio with pre-installed system portaudio libs
+   - TensorRT dependencies: onnxruntime_gpu, onnx_graphsurgeon
+   - Pre-clones and installs torch2trt and whisper_trt with error isolation
+   - CUDA availability verification step
+   - Pre-creates `/root/.cache/whisper` and `/root/.cache/whisper_trt` directories
+   - Optimizations: Cleans apt cache, removes temp build directories after installation
+
+2. **gpu-build.sh**
+   - Automated build and run script with configurable image name and container name
+   - Pre-creates host cache directories (`~/.cache/whisper`, `~/.cache/whisper_trt`)
+   - Builds local Dockerfile if present
+   - Comprehensive container launch with:
+     - GPU passthrough: `--gpus all`
+     - IPC optimization: `--ipc=host`
+     - Memory limits: `--ulimit memlock=-1 --ulimit stack=67108864`
+     - Audio device access: `--device /dev/snd --group-add audio` (resolves ALSA/device errors)
+     - Volume mounts for persistent model/cache storage
+     - Named container for easy restart/management
+   - Provides helpful notes and cleanup instructions
+   - Graceful container state management (exit, restart, cleanup commands)
+
+3. **Key improvements from experiments**
+   - Setuptools pinning prevents build isolation failures
+   - Audio device passthrough ensures live transcription works without restart
+   - Host cache mounts prevent container bloat and redundant model re-downloads
+   - Pre-installation of dependencies reduces first-run build time
+   - Error verification (CUDA check) fails fast if environment is misconfigured
+
+#### Usage
+```bash
+cd docker
+chmod +x gpu-build.sh
+./gpu-build.sh
+```
+
+To restart persistent container:
+```bash
+docker start -ai whisper-trt-enhanced-dev
+```
+
+To clean up:
+```bash
+docker rm whisper-trt-enhanced-dev
+```
 
 #### Docker Experiment Details (2026-05-08)
 
