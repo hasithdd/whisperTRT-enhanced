@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Detailed Docker experiment log for `nvcr.io/nvidia/pytorch:25.02-py3` environment setup and dependency resolution.
+- Explicit note that microphone permissions must be granted when starting the container (cannot be fixed after attach without restarting).
+- Explicit note to mount model cache directories to host before starting container to avoid redundant re-downloads and container bloat.
+
+#### Docker Experiment Details (2026-05-08)
+
+This entry captures an end-to-end container setup attempt where dependency issues were resolved one by one, followed by runtime issues related to container launch flags.
+
+1. **Base container launch**
+   - Container started with GPU and memory flags:
+   - `docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -it nvcr.io/nvidia/pytorch:25.02-py3 /bin/bash`
+   - CUDA availability verified (`torch.cuda.is_available() == True`).
+
+2. **Whisper package install issue and resolution**
+   - `pip install openai-whisper==20240927` initially failed during build metadata/wheel preparation.
+   - Upgraded packaging tools, then used non-isolated build.
+   - Resolved by pinning `setuptools==70.0.0` and installing with:
+   - `pip install --no-build-isolation openai-whisper==20240927`
+
+3. **whisper_trt dependency chain resolution**
+   - `whisper_trt` install initially failed due to missing `torch2trt`.
+   - Cloned and installed `torch2trt`, then installed `whisper_trt`.
+   - Runtime dependencies were resolved iteratively:
+     - Missing `pyaudio` -> installed system deps `portaudio19-dev python3-dev`, then installed `pyaudio`.
+     - Missing `onnxruntime` -> installed `onnxruntime_gpu`.
+     - Missing `onnx_graphsurgeon` -> installed `onnx_graphsurgeon`.
+   - After these, TensorRT runtime started and model assets downloaded/build process began successfully.
+
+4. **Critical runtime lesson: microphone access**
+   - Live transcription failed in container due to ALSA/device errors because container was not started with audio device permissions.
+   - Container must be launched with host audio access, e.g. include:
+   - `--device /dev/snd --group-add audio`
+   - Depending on host setup, PulseAudio/PipeWire socket mapping may also be required.
+
+5. **Critical storage lesson: mount model/cache paths to host**
+   - Whisper/whisper_trt downloads and TensorRT engine artifacts can be large.
+   - If cache/model paths are not bind-mounted, downloads remain inside container writable layer and are lost on container removal (and may grow container storage usage unnecessarily).
+   - Recommended mounts at container start:
+   - `-v $HOME/.cache/whisper:/root/.cache/whisper`
+   - `-v $HOME/.cache/whisper_trt:/root/.cache/whisper_trt`
+
+6. **Recommended improved launch command**
+   - `docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --device /dev/snd --group-add audio -v $HOME/.cache/whisper:/root/.cache/whisper -v $HOME/.cache/whisper_trt:/root/.cache/whisper_trt -it nvcr.io/nvidia/pytorch:25.02-py3 /bin/bash`
+
+#### Notes
+- `setup.py install` worked for this experiment but is deprecated; a modern `pip install .`-based flow is preferable for future updates.
+- Several package conflict warnings were observed while upgrading build tooling in-container; pinning versions helped complete the setup.
+
 ## [0.0.1] - 2026-05-02
 
 ### Added
