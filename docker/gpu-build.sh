@@ -5,9 +5,15 @@
 
 set -e
 
+# Resolve repository locations
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 # Configuration
-IMAGE_NAME="${1:-nvcr.io/nvidia/pytorch:25.02-py3}"
+IMAGE_NAME="${1:-whisper-trt-enhanced:latest}"
 CONTAINER_NAME="${2:-whisper-trt-enhanced}"
+MODEL_NAME="${3:-base.en}"
+BACKEND_NAME="${4:-whisper_trt}"
 CACHE_DIR="${HOME}/.cache"
 
 # Create cache directories on host if they don't exist
@@ -15,16 +21,16 @@ mkdir -p "${CACHE_DIR}/whisper"
 mkdir -p "${CACHE_DIR}/whisper_trt"
 
 echo "Building whisperTRT-enhanced Docker container..."
-echo "  Base Image: ${IMAGE_NAME}"
+echo "  Image Tag: ${IMAGE_NAME}"
 echo "  Container Name: ${CONTAINER_NAME}"
+echo "  Model: ${MODEL_NAME}"
+echo "  Backend: ${BACKEND_NAME}"
 echo "  Cache Directory: ${CACHE_DIR}"
 echo ""
 
-# Build the Docker image (if using local Dockerfile)
-if [ -f "./Dockerfile" ]; then
-    echo "Building Docker image from local Dockerfile..."
-    docker build -t "${CONTAINER_NAME}:latest" -f ./Dockerfile .
-fi
+# Build the Docker image from the repository root
+echo "Building Docker image from local Dockerfile..."
+docker build -t "${IMAGE_NAME}" -f "${SCRIPT_DIR}/Dockerfile" "${REPO_ROOT}"
 
 # Display the recommended run command
 echo ""
@@ -46,10 +52,12 @@ docker run \
     --group-add audio \
     -v "${CACHE_DIR}/whisper:/root/.cache/whisper" \
     -v "${CACHE_DIR}/whisper_trt:/root/.cache/whisper_trt" \
+    -v "${REPO_ROOT}:/workspace" \
+    --workdir /workspace \
     --name "${CONTAINER_NAME}-dev" \
     -it \
-    "${CONTAINER_NAME}:latest" \
-    /bin/bash
+    "${IMAGE_NAME}" \
+    python whisper_trt/examples/live_transcription.py "${MODEL_NAME}" --backend "${BACKEND_NAME}"
 
 echo ""
 echo "Container stopped. To restart, run:"

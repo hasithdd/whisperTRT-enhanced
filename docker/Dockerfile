@@ -4,51 +4,44 @@ FROM nvcr.io/nvidia/pytorch:25.02-py3
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    WHISPER_MODEL=base.en \
+    WHISPER_BACKEND=whisper_trt
 
 # Install system dependencies for audio and build tools
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
+    ffmpeg \
     libssl-dev \
     portaudio19-dev \
     python3-dev \
-    git \
-    wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade setuptools to specified version for compatibility
-RUN pip install --upgrade setuptools==70.0.0
+# Upgrade packaging tools for local installs
+RUN pip install --upgrade pip setuptools wheel
 
 # Create cache directories
 RUN mkdir -p /root/.cache/whisper /root/.cache/whisper_trt
 
-# Install openai-whisper with specific version and build flags
-RUN pip install --no-build-isolation openai-whisper==20240927
+WORKDIR /workspace
 
-# Install audio support
-RUN pip install pyaudio
+# Install Python dependencies required by the live transcription example
+RUN pip install --no-build-isolation \
+    openai-whisper==20240927 \
+    pyaudio \
+    onnxruntime \
+    onnx_graphsurgeon
 
-# Install TensorRT runtime dependencies
-RUN pip install onnxruntime_gpu onnx_graphsurgeon
+# Install the local torch2trt and whisper_trt packages from the workspace
+COPY torch2trt /workspace/torch2trt
+RUN pip install --no-build-isolation -e /workspace/torch2trt
 
-# Clone and install torch2trt
-RUN git clone https://github.com/NVIDIA-AI-IOT/torch2trt.git /tmp/torch2trt && \
-    cd /tmp/torch2trt && \
-    pip install --no-build-isolation . && \
-    rm -rf /tmp/torch2trt
-
-# Clone and install whisper_trt
-RUN git clone https://github.com/NVIDIA-AI-IOT/whisper_trt.git /tmp/whisper_trt && \
-    cd /tmp/whisper_trt && \
-    pip install --no-build-isolation . && \
-    rm -rf /tmp/whisper_trt
+COPY whisper_trt /workspace/whisper_trt
+RUN pip install --no-build-isolation -e /workspace/whisper_trt
 
 # Verify CUDA is available
 RUN python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'"
 
-# Set working directory
-WORKDIR /root
-
-# Default command
-CMD ["/bin/bash"]
+# Run live transcription by default
+CMD ["python", "whisper_trt/examples/live_transcription.py", "base.en", "--backend", "whisper_trt"]
