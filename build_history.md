@@ -12,6 +12,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Explicit note that microphone permissions must be granted when starting the container (cannot be fixed after attach without restarting).
 - Explicit note to mount model cache directories to host before starting container to avoid redundant re-downloads and container bloat.
 - Production-ready Dockerfile and gpu-build.sh based on experimental findings (2026-05-09).
+- Docker build now uses the local workspace sources for `torch2trt` and `whisper_trt` instead of cloning remote repositories.
+- `gpu-build.sh` now builds from the repository root and launches `whisper_trt/examples/live_transcription.py` with `base.en` and `--backend whisper_trt` by default.
+
+#### Docker Follow-up Update (2026-05-11)
+
+Refined the Docker workflow so the image is built from the current workspace and the container starts live transcription automatically.
+
+1. **Dockerfile updates**
+   - Installs runtime dependencies needed by live transcription, including `openai-whisper`, `pyaudio`, `onnxruntime`, and `onnx_graphsurgeon`
+   - Copies local `torch2trt` and `whisper_trt` sources into the image and installs them in editable mode
+   - Sets default runtime environment variables for `base.en` and `whisper_trt`
+   - Runs `whisper_trt/examples/live_transcription.py` by default instead of dropping into a shell
+
+2. **gpu-build.sh updates**
+   - Resolves the repository root automatically from the script location
+   - Builds the Docker image from the workspace root so local source changes are included
+   - Mounts the repository into `/workspace` for interactive development and runtime access
+   - Starts live transcription directly with `base.en` and the `whisper_trt` backend
 
 #### Docker Implementation (2026-05-09)
 
