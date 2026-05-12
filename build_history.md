@@ -7,6 +7,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Detailed Docker experiment log for `nvcr.io/nvidia/pytorch:25.02-py3` environment setup and dependency resolution.
+- Explicit note that microphone permissions must be granted when starting the container (cannot be fixed after attach without restarting).
+- Explicit note to mount model cache directories to host before starting container to avoid redundant re-downloads and container bloat.
+- Production-ready Dockerfile and gpu-build.sh based on experimental findings (2026-05-09).
+- Docker build now uses the local workspace sources for `torch2trt` and `whisper_trt` instead of cloning remote repositories.
+- `gpu-build.sh` now builds from the repository root and launches `whisper_trt/examples/live_transcription.py` with `base.en` and `--backend whisper_trt` by default.
+
+#### Docker Follow-up Update (2026-05-11)
+
+Refined the Docker workflow so the image is built from the current workspace and the container starts live transcription automatically.
+
+1. **Dockerfile updates**
+   - Installs runtime dependencies needed by live transcription, including `openai-whisper`, `pyaudio`, `onnxruntime`, and `onnx_graphsurgeon`
+   - Copies local `torch2trt` and `whisper_trt` sources into the image and installs them in editable mode
+   - Sets default runtime environment variables for `base.en` and `whisper_trt`
+   - Runs `whisper_trt/examples/live_transcription.py` by default instead of dropping into a shell
+
+2. **gpu-build.sh updates**
+   - Resolves the repository root automatically from the script location
+   - Builds the Docker image from the workspace root so local source changes are included
+   - Mounts the repository into `/workspace` for interactive development and runtime access
+   - Starts live transcription directly with `base.en` and the `whisper_trt` backend
+
+#### Docker Implementation (2026-05-09)
+
+Created production-ready Docker configuration incorporating lessons learned from 2026-05-08 experiments.
+
+1. **Dockerfile**
+   - Base: `nvcr.io/nvidia/pytorch:25.02-py3` with TensorRT and CUDA 12.8 pre-installed
+   - System dependencies: `build-essential`, `cmake`, `libssl-dev`, `portaudio19-dev`, `python3-dev`, `git`, `wget`
+   - Pinned setuptools to v70.0.0 for build compatibility
+   - Installs openai-whisper v20240927 with `--no-build-isolation` flag (resolves metadata/wheel build failures)
+   - Audio support: pyaudio with pre-installed system portaudio libs
+   - TensorRT dependencies: onnxruntime_gpu, onnx_graphsurgeon
+   - Pre-clones and installs torch2trt and whisper_trt with error isolation
+   - CUDA availability verification step
+   - Pre-creates `/root/.cache/whisper` and `/root/.cache/whisper_trt` directories
+   - Optimizations: Cleans apt cache, removes temp build directories after installation
+
+2. **gpu-build.sh**
+   - Automated build and run script with configurable image name and container name
+   - Pre-creates host cache directories (`~/.cache/whisper`, `~/.cache/whisper_trt`)
+   - Builds local Dockerfile if present
+   - Comprehensive container launch with:
+     - GPU passthrough: `--gpus all`
+     - IPC optimization: `--ipc=host`
+     - Memory limits: `--ulimit memlock=-1 --ulimit stack=67108864`
+     - Audio device access: `--device /dev/snd --group-add audio` (resolves ALSA/device errors)
+     - Volume mounts for persistent model/cache storage
+     - Named container for easy restart/management
+   - Provides helpful notes and cleanup instructions
+   - Graceful container state management (exit, restart, cleanup commands)
+
+3. **Key improvements from experiments**
+   - Setuptools pinning prevents build isolation failures
+   - Audio device passthrough ensures live transcription works without restart
+   - Host cache mounts prevent container bloat and redundant model re-downloads
+   - Pre-installation of dependencies reduces first-run build time
+   - Error verification (CUDA check) fails fast if environment is misconfigured
+
+#### Usage
+```bash
+cd docker
+chmod +x gpu-build.sh
+./gpu-build.sh
+```
+
+To restart persistent container:
+```bash
+docker start -ai whisper-trt-enhanced-dev
+```
+
+To clean up:
+```bash
+docker rm whisper-trt-enhanced-dev
+```
+
+#### Docker Experiment Details (2026-05-08)
+
+This entry captures an end-to-end container setup attempt where dependency issues were resolved one by one, followed by runtime issues related to container launch flags.
+
+1. **Base container launch**
+   - Container started with GPU and memory flags:
+   - `docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -it nvcr.io/nvidia/pytorch:25.02-py3 /bin/bash`
+   - CUDA availability verified (`torch.cuda.is_available() == True`).
+
+2. **Whisper package install issue and resolution**
+   - `pip install openai-whisper==20240927` initially failed during build metadata/wheel preparation.
+   - Upgraded packaging tools, then used non-isolated build.
+   - Resolved by pinning `setuptools==70.0.0` and installing with:
+   - `pip install --no-build-isolation openai-whisper==20240927`
+
+3. **whisper_trt dependency chain resolution**
+   - `whisper_trt` install initially failed due to missing `torch2trt`.
+   - Cloned and installed `torch2trt`, then installed `whisper_trt`.
+   - Runtime dependencies were resolved iteratively:
+     - Missing `pyaudio` -> installed system deps `portaudio19-dev python3-dev`, then installed `pyaudio`.
+     - Missing `onnxruntime` -> installed `onnxruntime_gpu`.
+     - Missing `onnx_graphsurgeon` -> installed `onnx_graphsurgeon`.
+   - After these, TensorRT runtime started and model assets downloaded/build process began successfully.
+
+4. **Critical runtime lesson: microphone access**
+   - Live transcription failed in container due to ALSA/device errors because container was not started with audio device permissions.
+   - Container must be launched with host audio access, e.g. include:
+   - `--device /dev/snd --group-add audio`
+   - Depending on host setup, PulseAudio/PipeWire socket mapping may also be required.
+
+5. **Critical storage lesson: mount model/cache paths to host**
+   - Whisper/whisper_trt downloads and TensorRT engine artifacts can be large.
+   - If cache/model paths are not bind-mounted, downloads remain inside container writable layer and are lost on container removal (and may grow container storage usage unnecessarily).
+   - Recommended mounts at container start:
+   - `-v $HOME/.cache/whisper:/root/.cache/whisper`
+   - `-v $HOME/.cache/whisper_trt:/root/.cache/whisper_trt`
+
+6. **Recommended improved launch command**
+   - `docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --device /dev/snd --group-add audio -v $HOME/.cache/whisper:/root/.cache/whisper -v $HOME/.cache/whisper_trt:/root/.cache/whisper_trt -it nvcr.io/nvidia/pytorch:25.02-py3 /bin/bash`
+
+#### Notes
+- `setup.py install` worked for this experiment but is deprecated; a modern `pip install .`-based flow is preferable for future updates.
+- Several package conflict warnings were observed while upgrading build tooling in-container; pinning versions helped complete the setup.
+
 ## [0.0.1] - 2026-05-02
 
 ### Added
