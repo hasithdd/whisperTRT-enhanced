@@ -15,6 +15,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docker build now uses the local workspace sources for `torch2trt` and `whisper_trt` instead of cloning remote repositories.
 - `gpu-build.sh` now builds from the repository root and launches `whisper_trt/examples/live_transcription.py` with `base.en` and `--backend whisper_trt` by default.
 
+#### Docker PyTorch Base Image Attempt (2026-05-21)
+
+Attempted to replace the NVIDIA NGC PyTorch image with locally available `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel` to reduce image pull times and use already-cached layers.
+
+1. **Initial Changes**
+   - Replaced base image from `nvcr.io/nvidia/pytorch:25.02-py3` to `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel`
+   - Image found locally in user's Docker registry
+
+2. **Build Issues Encountered**
+   - **PEP 668 Compliance Error**: PyTorch image enforces `externally-managed-environment` restriction, preventing system-wide package installations. Resolved by adding `--break-system-packages` flag to all pip install commands.
+   - **Build Backend Failure**: Using `--no-build-isolation` flag with pre-built wheel packages caused `wheel_stub.buildapi` import errors. Resolved by removing the `--no-build-isolation` flag and allowing standard wheel installation.
+   - **TensorRT Installation Deadlock**: Build process stalled during TensorRT dependency resolution (`tensorrt_cu13_libs==10.16.1.11`). The PyTorch base image lacks TensorRT pre-installation, causing pip to attempt building/downloading large TensorRT packages with extended resolution time. Build was interrupted (exit code 130).
+
+3. **Key Findings**
+   - The PyTorch OSS image (`pytorch/pytorch`) does not include TensorRT pre-installed, unlike NVIDIA NGC images
+   - TensorRT binary packages for CUDA 13 variants are significantly larger and require additional build infrastructure
+   - Image caching savings from using a locally-cached PyTorch image are offset by additional TensorRT installation complexity and time
+   - NVIDIA NGC PyTorch images (`nvcr.io/nvidia/pytorch`) are purpose-built with TensorRT bundled, making them more suitable for this use case despite requiring initial pull
+
+4. **Recommendation**
+   - Revert to NVIDIA NGC PyTorch image (`nvcr.io/nvidia/pytorch:25.02-py3` or equivalent)
+   - The pre-bundled TensorRT and optimized CUDA environment outweigh the initial image pull overhead
+   - For local builds, consider pre-pulling the NGC image once and creating a local cache/mirror
+
 #### Docker Follow-up Update (2026-05-11)
 
 Refined the Docker workflow so the image is built from the current workspace and the container starts live transcription automatically.
