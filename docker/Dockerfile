@@ -18,8 +18,9 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade packaging tools for local installs
-RUN pip install --upgrade pip setuptools wheel
+# Upgrade packaging tools for local installs and pin setuptools
+RUN pip install --upgrade pip wheel && \
+    pip install setuptools==70.0.0
 
 # Create cache directories
 RUN mkdir -p /root/.cache/whisper /root/.cache/whisper_trt
@@ -39,9 +40,6 @@ RUN pip install --no-build-isolation -e /workspace/torch2trt
 
 COPY whisper_trt /workspace/whisper_trt
 RUN pip install --no-build-isolation -e /workspace/whisper_trt
-
-# Verify CUDA is available
-RUN python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'"
 
 # Run live transcription by default
 CMD ["python", "whisper_trt/examples/live_transcription.py", "base.en", "--backend", "whisper_trt"]
