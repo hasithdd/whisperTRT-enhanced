@@ -7,6 +7,7 @@
 ## Table of Contents
  
 1. [Unreleased](#unreleased)
+   - [2026-05-26 — Audio Device Detection Overhaul & Container Name Conflict](#2026-05-26--audio-device-detection-overhaul--container-name-conflict)
    - [2026-05-24 — Integration Test & Runtime Validation](#2026-05-24--integration-test--runtime-validation)
    - [2026-05-21 — PyTorch OSS Base Image Experiment](#2026-05-21--pytorch-oss-base-image-experiment)
    - [2026-05-11 — Docker Workflow Refinement](#2026-05-11--docker-workflow-refinement)
@@ -16,6 +17,330 @@
 ---
  
 ## [Unreleased]
+ 
+---
+ 
+### 2026-05-26 — Audio Device Detection Overhaul & Container Name Conflict
+ 
+**Scope:** Root-cause analysis and full fix for the `UnboundLocalError` introduced in 2026-05-24. Robustified audio device discovery, added an environment-variable override, added a `--list-devices` CLI flag, and updated `gpu-build.sh` to forward the override into the container. Build succeeded; `docker run` exited with code 125 (container name conflict — not tested today; scheduled for 2026-05-27).
+ 
+#### Summary of Changes
+ 
+| Area | Status | Notes |
+|---|---|---|
+| Docker image build | ✅ Success | Rebuilt cleanly from local Dockerfile |
+| `find_respeaker_audio_device_index()` fix | ✅ Applied | `UnboundLocalError` eliminated; broadened matching; fallback added |
+| `AUDIO_DEVICE_INDEX` env override | ✅ Applied | Bypass detection entirely via env var |
+| `--list-devices` CLI flag | ✅ Applied | Enumerate devices and exit without starting transcription |
+| `gpu-build.sh` env passthrough | ✅ Applied | `AUDIO_DEVICE_INDEX` forwarded to `docker run -e` if set on host |
+| Container launch (`docker run`) | ❌ Exit 125 | Name conflict — `whisper-trt-enhanced-dev` still exists from 2026-05-24 |
+| Live transcription end-to-end | ⏳ Deferred | Will test 2026-05-27 after removing stale container |
+ 
+---
+ 
+#### Root-Cause Analysis — `UnboundLocalError`
+ 
+The crash from 2026-05-24 was reproduced and diagnosed precisely. The original implementation of `find_respeaker_audio_device_index()` in `whisper_trt/examples/live_transcription.py` was:
+ 
+```python
+def find_respeaker_audio_device_index():
+    p = pyaudio.PyAudio()
+    info = p.get_host_api_info_by_index(0)
+    num_devices = info.get("deviceCount")
+ 
+    for i in range(num_devices):
+        device_info = p.get_device_info_by_host_api_device_index(0, i)
+        if "respeaker" in device_info.get("name").lower():
+            device_index = i   # ← only assigned inside this branch
+ 
+    return device_index        # ← UnboundLocalError if no match
+```
+ 
+**Two separate bugs:**
+ 
+1. **`device_index` never initialised before the loop.** Python requires a variable to be assigned before it is read. Because `device_index` is only written inside the `if "respeaker"` branch, any run where no device name contains `"respeaker"` leaves it completely unbound. `return device_index` then raises `UnboundLocalError`.
+ 
+2. **`PyAudio` instance `p` is never terminated.** `p.terminate()` was absent, leaking the underlying PortAudio session on every call.
+ 
+**Why a standard headset triggers this:** A standard USB headset or built-in microphone is enumerated by ALSA/PortAudio under names such as `"USB Audio Device"`, `"HDA Intel PCH"`, `"pulse"`, or `"default"` — none of which contain the substring `"respeaker"`. The branch is therefore never entered, `device_index` stays unbound, and the crash follows.
+ 
+---
+ 
+#### Fix Applied — `find_respeaker_audio_device_index()` (full rewrite)
+ 
+File: `whisper_trt/examples/live_transcription.py`
+ 
+**New keyword list** defined at module level (checked against the lower-cased device name; first match wins):
+ 
+```python
+_AUDIO_MATCH_KEYWORDS = (
+    "respeaker", "usb", "microphone", "mic",
+    "headset", "headphone", "default", "input",
+)
+```
+ 
+**Resolution order inside the function:**
+ 
+| Priority | Source | Behaviour |
+|---|---|---|
+| 1 | `AUDIO_DEVICE_INDEX` env var | Parse as `int` and return immediately; raise `RuntimeError` if not a valid integer |
+| 2 | Keyword match | First input device (`maxInputChannels > 0`) whose name contains any keyword |
+| 3 | Fallback | First device with `maxInputChannels > 0`, regardless of name |
+| 4 | Failure | `RuntimeError` printing a numbered list of all input devices with index, name, and channel count |
+ 
+**Additional fixes in the same rewrite:**
+- `device_index = None` and `first_input_index = None` initialised before the loop — `UnboundLocalError` is impossible.
+- `p.terminate()` called in a `finally` block — PortAudio session is always released.
+- `input_device_descriptions` list built during the scan and included verbatim in the `RuntimeError` message so the user can immediately see which indices are valid.
+ 
+**New function in full:**
+ 
+```python
+def find_respeaker_audio_device_index():
+    """Return the best matching audio input device index.
+ 
+    Resolution order
+    ----------------
+    1. AUDIO_DEVICE_INDEX environment variable (integer override).
+    2. First input device whose name contains a keyword from
+       _AUDIO_MATCH_KEYWORDS (case-insensitive).
+    3. First device that reports maxInputChannels > 0.
+    4. RuntimeError listing every available input device.
+    """
+    env_val = os.environ.get("AUDIO_DEVICE_INDEX")
+    if env_val is not None:
+        try:
+            return int(env_val)
+        except ValueError:
+            raise RuntimeError(
+                f"AUDIO_DEVICE_INDEX='{env_val}' is not a valid integer."
+            )
+ 
+    p = pyaudio.PyAudio()
+    try:
+        info = p.get_host_api_info_by_index(0)
+        num_devices = info.get("deviceCount")
+ 
+        device_index = None        # explicit keyword match
+        first_input_index = None   # fallback: first device with input channels
+        input_device_descriptions = []
+ 
+        for i in range(num_devices):
+            device_info = p.get_device_info_by_host_api_device_index(0, i)
+            name = device_info.get("name", "")
+            max_input_ch = int(device_info.get("maxInputChannels", 0))
+ 
+            if max_input_ch > 0:
+                input_device_descriptions.append(
+                    f"  [{i}] {name!r}  (inputs: {max_input_ch})"
+                )
+                if first_input_index is None:
+                    first_input_index = i
+                if device_index is None:
+                    if any(kw in name.lower() for kw in _AUDIO_MATCH_KEYWORDS):
+                        device_index = i
+ 
+        # Fallback: any device that has at least one input channel
+        if device_index is None:
+            device_index = first_input_index
+ 
+        if device_index is None:
+            device_list = "\n".join(input_device_descriptions) or "  (none found)"
+            raise RuntimeError(
+                "No audio input device could be found.\n"
+                "Available input devices:\n"
+                f"{device_list}\n\n"
+                "Set the AUDIO_DEVICE_INDEX environment variable to the desired "
+                "device index, e.g.:\n"
+                "  docker run -e AUDIO_DEVICE_INDEX=0 ..."
+            )
+ 
+        return device_index
+    finally:
+        p.terminate()
+```
+ 
+---
+ 
+#### New Feature — `AUDIO_DEVICE_INDEX` Environment Variable Override
+ 
+When the automatic detection still fails (e.g. unusual device name, multi-sound-card system, ALSA enumeration order changes between runs), the user can hard-pin the device index at container start without rebuilding or editing source:
+ 
+```bash
+# Force device index 0
+docker run -e AUDIO_DEVICE_INDEX=0 ... python whisper_trt/examples/live_transcription.py base.en
+ 
+# Via gpu-build.sh on the host (see below)
+AUDIO_DEVICE_INDEX=0 sudo bash docker/gpu-build.sh
+```
+ 
+The env var is read at the very top of `find_respeaker_audio_device_index()`, before PyAudio is even initialised. An invalid (non-integer) value raises an immediate `RuntimeError` with a clear message rather than producing a confusing downstream crash.
+ 
+---
+ 
+#### New Feature — `--list-devices` CLI Flag
+ 
+A `--list-devices` flag was added to the `argparse` block in `live_transcription.py`. It enumerates every PortAudio input device and exits cleanly — no model is loaded, no TRT engine is touched.
+ 
+```bash
+# Run inside the container
+python whisper_trt/examples/live_transcription.py --list-devices
+ 
+# Or via docker run directly (no GPU or audio stream needed)
+docker run --rm \
+    --device /dev/snd \
+    --group-add audio \
+    whisper-trt-enhanced:latest \
+    python whisper_trt/examples/live_transcription.py --list-devices
+```
+ 
+Example output:
+ 
+```
+Available PyAudio input devices:
+  [0] 'USB Audio Device: - (hw:1,0)'  (inputs: 2)
+  [1] 'HDA Intel PCH: ALC256 Analog (hw:0,0)'  (inputs: 2)
+  [2] 'default'  (inputs: 32)
+  [3] 'pulse'  (inputs: 32)
+```
+ 
+Use the index shown here with `AUDIO_DEVICE_INDEX` or `-e AUDIO_DEVICE_INDEX=<n>` in `docker run`.
+ 
+The `model` positional argument was changed to `nargs="?"` so `--list-devices` can be invoked alone without supplying a model name. If `--list-devices` is not passed and `model` is omitted, `argparse` exits with a clear error.
+ 
+---
+ 
+#### `gpu-build.sh` Update — `AUDIO_DEVICE_INDEX` Passthrough
+ 
+File: `docker/gpu-build.sh`
+ 
+The following block was inserted immediately before `docker run`:
+ 
+```bash
+# Optionally forward AUDIO_DEVICE_INDEX so the host can override device
+# selection without rebuilding the image, e.g.:
+#   AUDIO_DEVICE_INDEX=1 sudo bash docker/gpu-build.sh
+AUDIO_DEVICE_INDEX_ARG=()
+if [ -n "${AUDIO_DEVICE_INDEX+x}" ]; then
+    AUDIO_DEVICE_INDEX_ARG=(-e "AUDIO_DEVICE_INDEX=${AUDIO_DEVICE_INDEX}")
+fi
+```
+ 
+And `"${AUDIO_DEVICE_INDEX_ARG[@]}"` was spliced into the `docker run` argument list:
+ 
+```bash
+docker run \
+    --gpus all \
+    ...
+    --name "${CONTAINER_NAME}-dev" \
+    "${AUDIO_DEVICE_INDEX_ARG[@]}" \   # ← injected here; empty when not set
+    -it \
+    "${IMAGE_NAME}" \
+    python whisper_trt/examples/live_transcription.py "${MODEL_NAME}" --backend "${BACKEND_NAME}"
+```
+ 
+The `${VAR+x}` test (rather than `-n "${VAR}"`) correctly distinguishes between "variable is unset" and "variable is set but empty", so passing `AUDIO_DEVICE_INDEX=0` (a falsy integer value) is forwarded correctly.
+ 
+---
+ 
+#### Runtime Failure — Exit Code 125 (Container Name Conflict)
+ 
+After the image built successfully, `docker run` exited immediately with code **125**. Exit code 125 is returned by the Docker CLI itself (before the container process starts) and almost always means one of two things:
+ 
+| Code 125 cause | How to identify | Fix |
+|---|---|---|
+| Container name already in use | `docker ps -a \| grep whisper-trt-enhanced-dev` shows an existing stopped container | `docker rm whisper-trt-enhanced-dev` |
+| Unknown `docker run` flag | Docker prints `unknown flag:` to stderr | Check the `docker run` argument list |
+ 
+**Most likely cause here:** The container `whisper-trt-enhanced-dev` was created during the 2026-05-24 test run and was never removed. The 2026-05-24 entry confirms the run ended with a Python crash inside the container; the container stopped but was not cleaned up. `gpu-build.sh` uses `--name "${CONTAINER_NAME}-dev"` which hardcodes the name; Docker refuses to create a second container with the same name.
+ 
+**Verify and fix before next test:**
+ 
+```bash
+# Check for the stale container
+docker ps -a | grep whisper-trt-enhanced-dev
+ 
+# Remove it
+docker rm whisper-trt-enhanced-dev
+ 
+# Optionally also clean dangling images to reclaim disk space
+docker image prune -f
+```
+ 
+After removing the stale container, `gpu-build.sh` will succeed in creating a fresh one.
+ 
+> **Note for future runs:** `gpu-build.sh` could be hardened to auto-remove stale containers with the same name before creating a new one. The following line added before `docker run` would eliminate the conflict entirely:
+> ```bash
+> docker rm "${CONTAINER_NAME}-dev" 2>/dev/null || true
+> ```
+> This is deferred to a future session — the current script is otherwise correct.
+ 
+---
+ 
+#### ALSA Warnings (Non-Fatal — Context)
+ 
+The following ALSA messages appear on every container start when PulseAudio is not running inside the container. They are **not errors** and do not block audio capture via ALSA directly:
+ 
+```
+ALSA lib pcm_dsnoop.c:567:(snd_pcm_dsnoop_open) unable to open slave
+ALSA lib pcm_dmix.c:1000:(snd_pcm_dmix_open) unable to open slave
+ALSA lib pcm.c:2721:(snd_pcm_open_noupdate) Unknown PCM cards.pcm.rear
+ALSA lib pcm.c:2721:(snd_pcm_open_noupdate) Unknown PCM cards.pcm.center_lfe
+ALSA lib pcm.c:2721:(snd_pcm_open_noupdate) Unknown PCM cards.pcm.side
+Cannot connect to server socket err = No such file or directory
+Cannot connect to server request channel
+jack server is not running or cannot be started
+```
+ 
+| Message | Cause | Action required |
+|---|---|---|
+| `unable to open slave` for dsnoop/dmix | ALSA dmix/dsnoop plugins attempt to open the shared PCM device; fail because device is held or no PulseAudio | None — these are probes, not errors |
+| `Unknown PCM cards.pcm.rear/center_lfe/side` | Surround-sound PCM aliases referenced in ALSA config but not present on the hardware | None |
+| `Cannot connect to server socket` | PulseAudio socket not present in container | None — ALSA direct access bypasses PulseAudio entirely |
+| `jack server is not running` | JACK audio not present | None |
+ 
+These messages are printed by PortAudio/ALSA during device enumeration and can be suppressed at the ALSA config level if desired, but suppressing them has no effect on functionality.
+ 
+---
+ 
+#### Files Changed
+ 
+| File | Change summary |
+|---|---|
+| `whisper_trt/examples/live_transcription.py` | `import os` added; `_AUDIO_MATCH_KEYWORDS` tuple; `find_respeaker_audio_device_index()` fully rewritten; `--list-devices` flag; `model` arg made optional |
+| `docker/gpu-build.sh` | `AUDIO_DEVICE_INDEX_ARG` array; passthrough into `docker run` |
+ 
+---
+ 
+#### Pre-Test Checklist for 2026-05-27
+ 
+Before running `sudo bash docker/gpu-build.sh` tomorrow:
+ 
+```bash
+# 1. Remove the stale container from the 2026-05-24 run
+docker rm whisper-trt-enhanced-dev
+ 
+# 2. Confirm no competing application holds the microphone on the host
+# (close browser tabs with mic access, video call apps, etc.)
+fuser /dev/snd/*
+ 
+# 3. Confirm the sound device is visible to the host
+aplay -l   # lists playback devices
+arecord -l # lists capture devices
+ 
+# 4. Optional — identify the correct device index before starting the container
+docker run --rm \
+    --device /dev/snd \
+    --group-add audio \
+    whisper-trt-enhanced:latest \
+    python whisper_trt/examples/live_transcription.py --list-devices
+ 
+# 5. If auto-detection still fails, pin the index explicitly
+AUDIO_DEVICE_INDEX=0 sudo bash docker/gpu-build.sh
+ 
+# 6. Standard run (auto-detection enabled)
+sudo bash docker/gpu-build.sh
+```
  
 ---
  

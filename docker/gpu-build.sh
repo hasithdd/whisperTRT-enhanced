@@ -42,6 +42,14 @@ echo "  2. Model and cache directories are mounted to preserve them on host"
 echo "  3. GPU access, IPC, and memory limits are configured for optimal performance"
 echo ""
 
+# Optionally forward AUDIO_DEVICE_INDEX so the host can override device
+# selection without rebuilding the image, e.g.:
+#   AUDIO_DEVICE_INDEX=1 sudo bash docker/gpu-build.sh
+AUDIO_DEVICE_INDEX_ARG=()
+if [ -n "${AUDIO_DEVICE_INDEX+x}" ]; then
+    AUDIO_DEVICE_INDEX_ARG=(-e "AUDIO_DEVICE_INDEX=${AUDIO_DEVICE_INDEX}")
+fi
+
 # Run the container with comprehensive configuration
 docker run \
     --gpus all \
@@ -55,6 +63,7 @@ docker run \
     -v "${REPO_ROOT}:/workspace" \
     --workdir /workspace \
     --name "${CONTAINER_NAME}-dev" \
+    "${AUDIO_DEVICE_INDEX_ARG[@]}" \
     -it \
     "${IMAGE_NAME}" \
     python whisper_trt/examples/live_transcription.py "${MODEL_NAME}" --backend "${BACKEND_NAME}"
